@@ -5,6 +5,7 @@ use std::ffi::CString;
 use crate::webcore::Blob;
 use crate::webcore::BlobExt as _;
 use crate::webcore::blob::Store;
+use crate::webcore::blob::store::Data as StoreData;
 use bun_core::{self, EncodedSlice, Output, Utf8Bytes, ZBox, strings};
 use bun_glob as glob;
 use bun_jsc::{
@@ -173,13 +174,9 @@ impl Archive {
         // Parse compression options
         let compress = parse_compression_options(global, options_arg)?;
 
-        // For Blob/Archive, ref the existing store (zero-copy)
         if let Some(blob) = blob_from_js(data_arg) {
-            if let Some(store) = blob.store.get().as_ref() {
-                return Ok(Box::new(Archive {
-                    store: store.clone(),
-                    compress,
-                }));
+            if let Some(store) = archive_store_from_blob(blob)? {
+                return Ok(Box::new(Archive { store, compress }));
             }
         }
 
@@ -270,6 +267,22 @@ fn create_archive(data: Vec<u8>, compress: Compression) -> Box<Archive> {
 #[inline]
 fn blob_from_js(value: JSValue) -> Option<&'static Blob> {
     value.as_class_ref::<Blob>()
+}
+
+/// An archive reads its whole store, so a slice of an in-memory Blob gets a copy of its bytes.
+fn archive_store_from_blob(blob: &Blob) -> Result<Option<RefPtr<Store>>, bun_alloc::AllocError> {
+    let Some(store) = blob.store() else {
+        return Ok(None);
+    };
+    if matches!(store.data, StoreData::Bytes(_)) && !blob.views_whole_store() {
+        let view = blob.shared_view();
+        let mut copy: Vec<u8> = Vec::new();
+        copy.try_reserve_exact(view.len())
+            .map_err(|_| bun_alloc::AllocError)?;
+        copy.extend_from_slice(view);
+        return Ok(Some(Store::init(copy)));
+    }
+    Ok(Some(store.clone()))
 }
 
 /// Shared helper that builds tarball bytes from a JS object
@@ -448,12 +461,12 @@ pub(crate) fn write(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<
         );
     }
 
-    // For Blobs, use store reference with options compression
+    // For Blobs, write the bytes of the Blob with options compression
     if let Some(blob) = blob_from_js(data_arg) {
-        if let Some(store) = blob.store.get().as_ref() {
+        if let Some(store) = archive_store_from_blob(blob)? {
             return start_write_task(
                 &cx,
-                WriteData::Store(store.clone()),
+                WriteData::Store(store),
                 path_slice.slice(),
                 options_compress,
             );
