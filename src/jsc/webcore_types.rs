@@ -329,6 +329,17 @@ impl Blob {
         &slice[..slice.len().min(self.size.get() as usize)]
     }
 
+    /// `true` only when this Blob is all of an in-memory store: not a slice, a file or S3.
+    pub fn views_whole_store(&self) -> bool {
+        let Some(store) = self.store() else {
+            return false;
+        };
+        match &store.data {
+            store::Data::Bytes(bytes) => self.offset.get() == 0 && self.size.get() >= bytes.len(),
+            store::Data::File(_) | store::Data::S3(_) => false,
+        }
+    }
+
     /// Release the store ref without
     /// dropping `self`.
     #[inline]
