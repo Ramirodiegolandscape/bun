@@ -268,7 +268,7 @@ pub(crate) struct NewServer<const SSL: bool, const DEBUG: bool> {
     /// ([`NewServer::is_drained`]); for Bun.serve it also holds the
     /// graceful-stop promise open ([`NewServer::is_closed`]).
     pub(crate) active_connection_count: core::cell::Cell<u32>,
-    /// The node:http tunnels in `active_connection_count` that are at read EOF and have nothing left to send.
+    /// The node:http tunnels in `active_connection_count` that do not read (reads stopped, or read EOF) and have nothing left to send.
     pub(crate) idle_tunnel_count: core::cell::Cell<u32>,
     /// Live `ServerWebSocket` count. Lives on the server (not the websocket
     /// context) so a reload's context swap cannot reset it, and sits in a
@@ -498,7 +498,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
     /// uWS filter: `+2` at TCP accept (before any TLS handshake), `-2` on
     /// `HttpContext::onClose` / `HttpResponse::upgrade()` — see
     /// `AsyncSocketData::filteredAccept`. Feeds [`Self::active_connection_count`].
-    /// `-3` / `+3`: a node:http tunnel becomes idle / has bytes to send again. `-4`: it closes idle.
+    /// `-3` / `+3`: a node:http tunnel becomes idle / reads again or has bytes to send again. `-4`: it closes idle.
     extern "C" fn on_connection_filter(
         _socket: *mut uws_sys::us_socket_t,
         opened: i32,
@@ -520,8 +520,11 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
                 3 => {
                     this.note_tunnel_idle(false);
                     // With a listener open, the loop ref is the user's to drop (`server.unref()`).
-                    if !this.has_listener() {
-                        // SAFETY: `this` is not used again, and a tunnel write never runs inside `app.close()`.
+                    // The `app.close()` drain runs abort callbacks, and their JavaScript can write
+                    // to a tunnel or start its reads. That drain closes the tunnel too.
+                    if !this.has_listener() && !this.deinit_running.get() {
+                        // SAFETY: `this` is not used again, and `deinit_running` rules out
+                        // an outer `&mut self`.
                         unsafe { &mut *user_data.cast::<Self>() }.ref_();
                     }
                     return;
@@ -1624,7 +1627,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         });
     }
 
-    /// An idle tunnel is open but, like a libuv handle at EOF with no write pending, does not hold the loop.
+    /// An idle tunnel is open but, like a libuv handle that does not read and has no write pending, does not hold the loop.
     fn has_loop_holding_connections(&self) -> bool {
         self.active_connection_count.get() > self.idle_tunnel_count.get()
     }

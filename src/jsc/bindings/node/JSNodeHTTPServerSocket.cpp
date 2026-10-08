@@ -197,11 +197,12 @@ void JSNodeHTTPServerSocket::applyTunnelReads()
 void JSNodeHTTPServerSocket::readStop()
 {
     // After the end of the stream no _read() comes to start the reads again.
-    if (!isTunnel(this) || tunnelReadEnded) {
+    if (tunnelReadsStopped || tunnelReadEnded || !isTunnel(this)) {
         return;
     }
     tunnelReadsStopped = true;
     applyTunnelReads();
+    updateTunnelIdle();
 }
 
 void JSNodeHTTPServerSocket::readStart()
@@ -209,7 +210,13 @@ void JSNodeHTTPServerSocket::readStart()
     if (!isTunnel(this)) {
         return;
     }
-    tunnelReadsStopped = false;
+    if (tunnelReadsStopped) [[unlikely]] {
+        tunnelReadsStopped = false;
+        // Before applyTunnelReads(): us_socket_resume() closes a socket whose poll it cannot arm again.
+        if (!tunnelReadEnded) {
+            setTunnelIdle(false);
+        }
+    }
     applyTunnelReads();
 }
 
@@ -392,6 +399,8 @@ JSC::EncodedJSValue JSNodeHTTPServerSocket::halfClose(JSC::JSGlobalObject* globa
     if (socket && cycleReads) {
         us_socket_resume(socket);
     }
+    // A FIN that could not leave yet (the close_notify of TLS) is left to send.
+    updateTunnelIdle();
     return result;
 }
 
@@ -887,16 +896,26 @@ extern "C" bool Bun__NodeHTTPServerSocket__writeBehindResponse(us_socket_t* sock
     return is_ssl ? writeBehindResponse<true>(socket, data, length) : writeBehindResponse<false>(socket, data, length);
 }
 
+void JSNodeHTTPServerSocket::setTunnelIdle(bool idle)
+{
+    if (is_ssl) {
+        reinterpret_cast<uWS::HttpResponse<true>*>(socket)->setNodeHttpTunnelIdle(idle);
+    } else {
+        reinterpret_cast<uWS::HttpResponse<false>*>(socket)->setNodeHttpTunnelIdle(idle);
+    }
+}
+
 void JSNodeHTTPServerSocket::updateTunnelIdle()
 {
-    if (!tunnelReadEnded || upgraded || isClosed()) {
+    // A tunnel that reads is never idle. readStart() tells uWS when the reads start again.
+    if (!(tunnelReadEnded || tunnelReadsStopped) || upgraded || isClosed()) {
         return;
     }
     const bool sent = streamBuffer.bufferedSize() == 0;
     if (is_ssl) {
-        reinterpret_cast<uWS::HttpResponse<true>*>(socket)->setNodeHttpTunnelIdle(sent && reinterpret_cast<uWS::AsyncSocket<true>*>(socket)->hasFullyDrained());
+        setTunnelIdle(sent && reinterpret_cast<uWS::AsyncSocket<true>*>(socket)->hasFullyDrained());
     } else {
-        reinterpret_cast<uWS::HttpResponse<false>*>(socket)->setNodeHttpTunnelIdle(sent && reinterpret_cast<uWS::AsyncSocket<false>*>(socket)->hasFullyDrained());
+        setTunnelIdle(sent && reinterpret_cast<uWS::AsyncSocket<false>*>(socket)->hasFullyDrained());
     }
 }
 

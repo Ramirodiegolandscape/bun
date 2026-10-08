@@ -1924,6 +1924,78 @@ test("a half-open tunnel with bytes left to send keeps the process alive until t
   }
 });
 
+// In Node.js a socket stops the reads of its handle when its buffer is full, and a handle that does
+// not read and has nothing to send is not active: it does not keep the process alive. The fixtures
+// run under Node.js as they are, and every expectation below is Node v26.3.0's.
+describe.concurrent.each(["http", "https"])("%s: a tunnel that nothing reads and that stopped its reads", proto => {
+  async function run(env: Record<string, string>) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(import.meta.dir, "node-http-connect-read-stopped-fixture.js")],
+      env: { ...bunEnv, PROTO: proto, CERT: tlsCert.cert, KEY: tlsCert.key, ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout: stdout && JSON.parse(stdout), stderr, exitCode, signalCode: proc.signalCode };
+  }
+  const requests = ["upgrade", "connect", "upgrade with a body"];
+
+  test.each(["before", "after"])(
+    "does not keep the process alive when server.close() comes %s the stop",
+    async close => {
+      // The sockets are still open, so neither they nor the server emit 'close'.
+      const atRest = { events: [], received: 0 };
+      expect(await run({ CLOSE: close })).toEqual({
+        stdout: Object.fromEntries(
+          requests.flatMap(request => [
+            [`${request}, the peer leaves`, atRest],
+            [`${request}, the peer stays`, atRest],
+            [`${request}, the listener ended it at once`, atRest],
+            [`${request}, the listener ends it later`, atRest],
+            [`${request}, the listener writes to it later`, { events: ["write callback"], received: 0 }],
+          ]),
+        ),
+        stderr: "",
+        exitCode: 0,
+        signalCode: null,
+      });
+    },
+  );
+
+  test("keeps the process alive again from the moment it reads again, up to 'close'", async () => {
+    expect(await run({ CLOSE: "before", READ_LATER: "1" })).toEqual({
+      stdout: {
+        ...Object.fromEntries(
+          requests.map(request => [`${request}, the peer stays`, { events: ["end", "close"], received: 4 * 65536 }]),
+        ),
+        server: "close",
+      },
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
+  });
+});
+
+// pipe() pauses the client's socket while the upstream is slow, and it does not resume it when the
+// upstream goes away. The expectation is Node v26.3.0's.
+test("a CONNECT proxy by pipes exits after server.close() when its upstream went away", async () => {
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), join(import.meta.dir, "node-http-connect-proxy-pipes-fixture.js")],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  // The client's socket is still open, so the proxy does not emit 'close'.
+  expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+    stdout: '{"clientSocketIsPaused":true}\n',
+    stderr: "",
+    exitCode: 0,
+    signalCode: null,
+  });
+});
+
 // A listener with nothing to send ends its side in the listener. It still reads: an http.Server
 // socket has allowHalfOpen. Every expectation below is Node v26.3.0's.
 describe("a tunnel behind a request head that took more than one read", () => {
