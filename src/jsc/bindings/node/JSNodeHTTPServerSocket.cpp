@@ -165,6 +165,10 @@ void JSNodeHTTPServerSocket::upgradeToTunnelMode(bool afterBody, WebCore::JSNode
     if (response != nullptr && response->m_ctx != nullptr) {
         Bun__NodeHTTPResponse_markTunneled(response->m_ctx);
     }
+    // socket.unref() came before the request.
+    if (tunnelUnrefed) [[unlikely]] {
+        updateTunnelIdle();
+    }
 }
 
 template<bool SSL>
@@ -213,11 +217,21 @@ void JSNodeHTTPServerSocket::readStart()
     if (tunnelReadsStopped) [[unlikely]] {
         tunnelReadsStopped = false;
         // Before applyTunnelReads(): us_socket_resume() closes a socket whose poll it cannot arm again.
-        if (!tunnelReadEnded) {
+        if (!tunnelReadEnded && !tunnelUnrefed) {
             setTunnelIdle(false);
         }
     }
     applyTunnelReads();
+}
+
+void JSNodeHTTPServerSocket::setRef(bool ref)
+{
+    tunnelUnrefed = !ref;
+    if (!ref) {
+        updateTunnelIdle();
+    } else if (!tunnelReadEnded && !tunnelReadsStopped && isTunnel(this)) {
+        setTunnelIdle(false);
+    }
 }
 
 void JSNodeHTTPServerSocket::didDeliverQueuedTunnelBytes(size_t length)
@@ -907,8 +921,9 @@ void JSNodeHTTPServerSocket::setTunnelIdle(bool idle)
 
 void JSNodeHTTPServerSocket::updateTunnelIdle()
 {
-    // A tunnel that reads is never idle. readStart() tells uWS when the reads start again.
-    if (!(tunnelReadEnded || tunnelReadsStopped) || upgraded || isClosed()) {
+    // A tunnel that reads and is ref'd is never idle. readStart() and setRef() tell uWS when it is both again.
+    // socket.unref() can come before the tunnel: a connection that parses HTTP is never idle here.
+    if (!(tunnelReadEnded || tunnelReadsStopped || tunnelUnrefed) || !isTunnel(this)) {
         return;
     }
     const bool sent = streamBuffer.bufferedSize() == 0;

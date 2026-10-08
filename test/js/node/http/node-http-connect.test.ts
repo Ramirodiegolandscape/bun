@@ -1977,6 +1977,38 @@ describe.concurrent.each(["http", "https"])("%s: a tunnel that nothing reads and
   });
 });
 
+// Like those of a libuv handle: unref() takes the reads of a tunnel out of what keeps the process
+// alive, ref() puts them back, and bytes left to send keep it alive in both states. The fixture
+// runs under Node.js as it is, and every expectation below is Node v26.3.0's.
+test.concurrent.each(["http", "https"])("%s: socket.unref() and socket.ref() on a tunnel", async proto => {
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), join(import.meta.dir, "node-http-connect-unref-fixture.js")],
+    env: { ...bunEnv, PROTO: proto, CERT: tlsCert.cert, KEY: tlsCert.key },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const atRest = { events: [], received: 0 };
+  expect({ stdout: stdout && JSON.parse(stdout), stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+    stdout: {
+      "upgrade, unref() before the request": atRest,
+      "upgrade, unref() while it reads": atRest,
+      "connect, unref() while it reads": atRest,
+      "upgrade, unref(), then a write": { events: ["write callback"], received: 0 },
+      "upgrade, a write, then unref()": { events: ["write callback"], received: 0 },
+      "upgrade, ref() after its reads stopped": atRest,
+      ...(proto === "http" && { "upgrade, ref() at the end of the stream": { events: ["end"], received: 0 } }),
+      // It gets what the socket had buffered, and the process does not wait for more.
+      "upgrade, unref(), then its reads stop, then a reader": { events: [], received: 65536 },
+      // The process waits for the rest.
+      "upgrade, unref(), then ref(), then a reader": { events: ["end", "close"], received: 2 * 65536 },
+    },
+    stderr: "",
+    exitCode: 0,
+    signalCode: null,
+  });
+});
+
 // pipe() pauses the client's socket while the upstream is slow, and it does not resume it when the
 // upstream goes away. The expectation is Node v26.3.0's.
 test("a CONNECT proxy by pipes exits after server.close() when its upstream went away", async () => {

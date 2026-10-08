@@ -268,7 +268,7 @@ pub(crate) struct NewServer<const SSL: bool, const DEBUG: bool> {
     /// ([`NewServer::is_drained`]); for Bun.serve it also holds the
     /// graceful-stop promise open ([`NewServer::is_closed`]).
     pub(crate) active_connection_count: core::cell::Cell<u32>,
-    /// The node:http tunnels in `active_connection_count` that do not read (reads stopped, or read EOF) and have nothing left to send.
+    /// The node:http tunnels in `active_connection_count` whose reads do not hold the loop (stopped, at EOF, or unref'd) and that have nothing left to send.
     pub(crate) idle_tunnel_count: core::cell::Cell<u32>,
     /// Live `ServerWebSocket` count. Lives on the server (not the websocket
     /// context) so a reload's context swap cannot reset it, and sits in a
@@ -498,7 +498,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
     /// uWS filter: `+2` at TCP accept (before any TLS handshake), `-2` on
     /// `HttpContext::onClose` / `HttpResponse::upgrade()` — see
     /// `AsyncSocketData::filteredAccept`. Feeds [`Self::active_connection_count`].
-    /// `-3` / `+3`: a node:http tunnel becomes idle / reads again or has bytes to send again. `-4`: it closes idle.
+    /// `-3` / `+3`: a node:http tunnel becomes idle / is not idle any more (`HttpResponse::setNodeHttpTunnelIdle`). `-4`: it closes idle.
     extern "C" fn on_connection_filter(
         _socket: *mut uws_sys::us_socket_t,
         opened: i32,
@@ -1627,7 +1627,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         });
     }
 
-    /// An idle tunnel is open but, like a libuv handle that does not read and has no write pending, does not hold the loop.
+    /// An idle tunnel is open but, like a libuv handle that does not read or is unref'd, with no write pending, does not hold the loop.
     fn has_loop_holding_connections(&self) -> bool {
         self.active_connection_count.get() > self.idle_tunnel_count.get()
     }
