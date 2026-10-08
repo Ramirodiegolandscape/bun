@@ -30,6 +30,7 @@ const { isTypedArray } = require("node:util/types");
 const { hideFromStack, hasObserver, enqueueNodeEntry, PerformanceNodeEntry } = require("internal/shared");
 const { STATUS_CODES, utcDate } = require("internal/http");
 const { kTimeout, getTimerDuration } = require("internal/timers");
+const { kSecureConnectDone } = require("internal/net/symbols");
 const tls = require("node:tls");
 const net = require("node:net");
 const fs = require("node:fs");
@@ -409,6 +410,14 @@ const kGoawayCode = Symbol("goawayCode");
 const kGoawayLastStreamID = Symbol("goawayLastStreamID");
 const kReleaseUnannouncedStream = Symbol("releaseUnannouncedStream");
 const kGoawaySent = Symbol("goawaySent");
+// Node's kState.flags: https://github.com/nodejs/node/blob/v26.3.0/lib/internal/http2/core.js#L342-L345
+const kSessionFlags = Symbol("sessionFlags");
+enum SessionFlags {
+  // Set when the session takes its connected socket (node's setupHandle). Never cleared.
+  Ready = 1 << 0,
+  // Set by close() only. destroy() leaves it clear.
+  Closed = 1 << 1,
+}
 
 // Node's socketOnError: once a GOAWAY has been received the peer is fully
 // within its rights to drop the connection, so an ECONNRESET behind it is
@@ -1892,13 +1901,19 @@ interface ClientRequestOptions {
   silent?: boolean;
   weight?: number;
 }
-type Socket = import("node:net").Socket & { servername?: undefined; alpnProtocol?: undefined };
-type TLSSocket = import("node:tls").TLSSocket;
+type Socket = import("node:net").Socket & {
+  servername?: undefined;
+  alpnProtocol?: undefined;
+  secureConnecting?: undefined;
+};
+// secureConnecting is true until the TLS handshake completes.
+type TLSSocket = import("node:tls").TLSSocket & { secureConnecting?: boolean };
 
 abstract class Http2Session extends EventEmitter {
   declare timeout: number | undefined;
   abstract get destroyed(): boolean;
   abstract destroy(error?: Error | number | null, code?: number): void;
+  abstract get [bunHTTP2Native](): typeof H2FrameParser | null;
   [bunHTTP2SessionTeardownFrame]: typeof kNoSessionTeardown | import("./async_hooks").Frame | undefined =
     kNoSessionTeardown;
   [bunHTTP2Socket]: TLSSocket | Socket | null | undefined;
@@ -1907,6 +1922,23 @@ abstract class Http2Session extends EventEmitter {
   // run inside it so 'close' doesn't inherit the last stream's frame.
   [bunHTTP2AsyncContextFrame] = $getInternalField($asyncContext, 0);
   [kDeferWriteCallback]: typeof process.nextTick | typeof setImmediate = setImmediate;
+  [kSessionFlags]: number = 0;
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/http2/core.js#L1399-L1406
+  get connecting() {
+    return (this[kSessionFlags] & SessionFlags.Ready) === 0;
+  }
+  get closed() {
+    return (this[kSessionFlags] & SessionFlags.Closed) !== 0;
+  }
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/http2/core.js#L1520-L1523
+  get state() {
+    if ((this[kSessionFlags] & SessionFlags.Ready) !== 0 && !this.destroyed) {
+      // A socket 'close' drops the parser before destroy() detaches the socket.
+      const parser = this[bunHTTP2Native];
+      if (parser) return parser.getCurrentState();
+    }
+    return {};
+  }
   // The GOAWAY this side received (not one it sent), like node's Http2Session getters.
   get goawayCode() {
     return this[kGoawayCode] || NGHTTP2_NO_ERROR;
@@ -3717,6 +3749,13 @@ function connectWithProtocol(protocol: string, options: Http2ConnectOptions, lis
 function emitConnectNT(self, socket) {
   self.emit("connect", self, socket);
 }
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/http2/core.js#L1088-L1103
+function setupServerSession(session: Http2Session, socket: TLSSocket | Socket) {
+  // node emits 'connect' on a destroyed session. Here it would follow the 'close' that destroy() queued.
+  if (session.destroyed) return;
+  session[kSessionFlags] |= SessionFlags.Ready;
+  process.nextTick(emitConnectNT, session, socket);
+}
 
 function destroyWithInvalidSessionNT(stream) {
   if (!stream.destroyed) stream.destroy($ERR_HTTP2_INVALID_SESSION());
@@ -4013,9 +4052,6 @@ class ServerHttp2Session extends Http2Session {
   #closed: boolean = false;
   // One-shot destroy latch (Node: "if (this.destroyed) return;" opens destroy()).
   #destroying: boolean = false;
-  /// closeCalled tracks whether close() specifically was called: `session.closed` only reports a
-  /// graceful close() in node — destroy() leaves it false while `session.destroyed` flips to true.
-  #closeCalled: boolean = false;
   /// connected indicates that the connection/socket is connected
   #connected: boolean = false;
   #connections: number = 0;
@@ -4533,7 +4569,16 @@ class ServerHttp2Session extends Http2Session {
     socket.on("data", this.#onRead.bind(this));
     socket.on("drain", this.#onDrain.bind(this));
 
-    process.nextTick(emitConnectNT, this, socket);
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/http2/core.js#L1337-L1350
+    if (socket.connecting || socket.secureConnecting) {
+      // A server-side TLS socket emits no 'secureConnect'.
+      socket.once(
+        socket instanceof TLSSocket ? kSecureConnectDone : "connect",
+        setupServerSession.bind(undefined, this, socket),
+      );
+    } else {
+      setupServerSession(this, socket);
+    }
   }
 
   // undefined for performServerHandshake() sessions; node never clears it, not even on destroy().
@@ -4551,13 +4596,6 @@ class ServerHttp2Session extends Http2Session {
   get alpnProtocol() {
     return this.#alpnProtocol;
   }
-  get connecting() {
-    const socket = this[bunHTTP2Socket];
-    if (!socket) {
-      return false;
-    }
-    return socket.connecting || false;
-  }
   get connected() {
     return this[bunHTTP2Socket]?.connecting === false;
   }
@@ -4566,9 +4604,6 @@ class ServerHttp2Session extends Http2Session {
   }
   get encrypted() {
     return this.#encrypted;
-  }
-  get closed() {
-    return this.#closeCalled;
   }
 
   get remoteSettings() {
@@ -4597,9 +4632,6 @@ class ServerHttp2Session extends Http2Session {
     if (this.#socket_proxy) return this.#socket_proxy;
     this.#socket_proxy = new Proxy(this, proxySocketHandler);
     return this.#socket_proxy;
-  }
-  get state() {
-    return this.#parser?.getCurrentState();
   }
 
   get [bunHTTP2Native]() {
@@ -4713,7 +4745,7 @@ class ServerHttp2Session extends Http2Session {
   close(callback?: (...args: any[]) => void) {
     if (this.#closed || this.destroyed) return;
     this.#closed = true;
-    this.#closeCalled = true;
+    this[kSessionFlags] |= SessionFlags.Closed;
 
     if (typeof callback === "function") {
       this.once("close", callback);
@@ -4973,9 +5005,6 @@ class ClientHttp2Session extends Http2Session {
   #closed: boolean = false;
   // One-shot destroy latch (Node: "if (this.destroyed) return;" opens destroy()).
   #destroying: boolean = false;
-  /// closeCalled tracks whether close() specifically was called: `session.closed` only reports a
-  /// graceful close() in node — destroy() leaves it false while `session.destroyed` flips to true.
-  #closeCalled: boolean = false;
   /// connected indicates that the connection/socket is connected
   #connected: boolean = false;
   #connections: number = 0;
@@ -5406,6 +5435,7 @@ class ClientHttp2Session extends Http2Session {
   #onConnect() {
     const socket = this[bunHTTP2Socket];
     if (!socket) return;
+    this[kSessionFlags] |= SessionFlags.Ready;
     this.#connected = true;
     // check if h2 is supported only for TLSSocket
     if (socket instanceof TLSSocket) {
@@ -5497,13 +5527,6 @@ class ClientHttp2Session extends Http2Session {
       parser.flush();
     }
   }
-  get connecting() {
-    const socket = this[bunHTTP2Socket];
-    if (!socket) {
-      return false;
-    }
-    return socket.connecting || false;
-  }
   get connected() {
     return this[bunHTTP2Socket]?.connecting === false;
   }
@@ -5512,9 +5535,6 @@ class ClientHttp2Session extends Http2Session {
   }
   get encrypted() {
     return this.#encrypted;
-  }
-  get closed() {
-    return this.#closeCalled;
   }
 
   get remoteSettings() {
@@ -5603,9 +5623,6 @@ class ClientHttp2Session extends Http2Session {
     if (this.#socket_proxy) return this.#socket_proxy;
     this.#socket_proxy = new Proxy(this, proxySocketHandler);
     return this.#socket_proxy;
-  }
-  get state() {
-    return this.#parser?.getCurrentState();
   }
 
   settings(settings: Settings, callback?) {
@@ -5733,6 +5750,8 @@ class ClientHttp2Session extends Http2Session {
         const connectEvent = socket instanceof tls.TLSSocket ? "secureConnect" : "connect";
         socket.once(connectEvent, onConnect.bind(this));
       } else {
+        // node sets up a connected socket in the constructor.
+        this[kSessionFlags] |= SessionFlags.Ready;
         connectOnNextTick = true;
       }
     } else {
@@ -5790,7 +5809,7 @@ class ClientHttp2Session extends Http2Session {
   close(callback?: (...args: any[]) => void) {
     if (this.#closed || this.destroyed) return;
     this.#closed = true;
-    this.#closeCalled = true;
+    this[kSessionFlags] |= SessionFlags.Closed;
 
     if (typeof callback === "function") {
       this.once("close", callback);
